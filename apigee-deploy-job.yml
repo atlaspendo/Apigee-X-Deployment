@@ -229,3 +229,55 @@ jobs:
         #       echo "INFO: Running smoke test..."
         #       # curl -I https://your-apigee-proxy-endpoint/...
         #       echo "WARNING: Actual smoke test skipped."
+
+
+
+
+
+
+
+#Key Features for Teams:
+
+#Clear Parameters: Pipeline parameters (apiProxyName, environmentGroup) are defined with displayName for a user-friendly UI when running manually.
+
+#Descriptive Stage/Job Names: displayName properties clearly indicate what each stage and job does, including the target environment and proxy name.
+
+#Extensive Logging:
+
+#echo "INFO: ...": Provides context about what the script is doing.
+
+#echo "DEBUG: ...": Outputs detailed information useful for troubleshooting (like variable values, API responses). Can be filtered in AzDO logs.
+
+#echo "##[command]...": Logs the actual commands being run, making it easy to see execution flow.
+
+#echo "##vso[task.logissue type=error;]...": Logs errors prominently in the Azure DevOps UI.
+
+#echo "##vso[task.logissue type=warning;]...": Logs warnings (e.g., fallback logic used).
+
+#set -e: Ensures Bash scripts stop immediately on error, preventing unexpected behavior.
+
+#Explicit Error Handling: curl calls use --fail and exit codes ($?) are explicitly checked, providing clear error messages if API calls fail. The full API response is logged on error for easier debugging.
+
+#Configuration Visibility: Key configuration settings (GCP Project, SA, Apigee Env/Org) are logged at the beginning of relevant steps. gcloud config list shows the active configuration.
+
+#Structured Output: Output is formatted to clearly separate informational messages, debug logs, commands, and errors.
+
+#Template Usage: Separating the deployment logic into a template (templates/apigee-deploy-job.yml) promotes reusability and makes the main pipeline (azure-pipelines.yml) much cleaner and easier to understand the overall flow.
+
+#Comments: YAML files are commented to explain the purpose of different sections, parameters, and key steps.
+
+#AzDO Environment Integration: The deployment job type and environment: property link the execution to Azure DevOps Environments, enabling built-in approval workflows and deployment tracking.
+
+#How to Share with Teams:
+
+#Commit both azure-pipelines.yml and templates/apigee-deploy-job.yml to the root and /templates directory (respectively) of the Git repository.
+
+#Provide the README.md file (from the previous response) explaining the overall setup.
+
+#Point teams to the pipeline definition in Azure DevOps.
+
+#Explain the parameters required to run the pipeline manually.
+
+#Show them how to interpret the logs, especially the INFO, DEBUG, and ERROR messages, during pipeline execution.
+
+#Ensure they understand the branch triggering strategy (develop, release/*, main) and the approval process configured in Azure DevOps Environments.

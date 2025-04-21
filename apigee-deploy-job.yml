@@ -1,0 +1,231 @@
+# templates/apigee-deploy-job.yml
+#
+# Reusable Azure DevOps Pipeline Job Template for deploying an Apigee X proxy.
+# Handles artifact download, GCP authentication via Workload Identity Federation
+# with Service Account impersonation, and calls Apigee Management APIs.
+# Includes detailed logging and error handling.
+
+parameters:
+  # --- Parameters passed from the main pipeline ---
+  gcpProject: ''               # Target GCP Project ID (e.g., 'your-nonprod-project-id')
+  apigeeOrg: ''                # Target Apigee Organization ID (usually same as gcpProject)
+  apigeeEnv: ''                # Target Apigee Environment Name (e.g., 'dev', 'test', 'prod')
+  apiProxyName: ''             # Name of the API Proxy being deployed
+  targetGcpServiceAccount: ''  # Full email of the GCP SA to impersonate for this deployment
+  agentKsaNamespace: 'azdo-agents' # K8s namespace of the agent runner
+  agentKsaName: 'azdo-agent-ksa'     # K8s service account name of the agent runner
+  artifactName: ''             # Name of the pipeline artifact containing the proxy bundle
+  azdoEnvironmentName: ''      # Name of the Azure DevOps Environment for approvals/tracking
+
+jobs:
+# Use a 'deployment' job type to integrate with Azure DevOps Environments for approvals and tracking
+- deployment: DeployApigeeProxy
+  displayName: 'Deploy Proxy ${{ parameters.apiProxyName }} to ${{ parameters.apigeeEnv }} [${{ parameters.gcpProject }}]'
+  environment: ${{ parameters.azdoEnvironmentName }} # Links job to the specified AzDO Environment (enables approvals)
+  strategy:
+    runOnce: # Standard deployment strategy
+      deploy:
+        steps:
+        # No source code checkout needed here, we use the published artifact
+        - checkout: none
+          displayName: 'Skip Source Checkout'
+
+        # --- Download Artifact ---
+        - task: DownloadPipelineArtifact@2
+          displayName: 'Download API Proxy Bundle Artifact'
+          inputs:
+            artifact: ${{ parameters.artifactName }}
+            path: '$(Pipeline.Workspace)/proxy_bundle' # Download to a specific folder in the agent's workspace
+          # helpText: 'Downloads the zip file created during the Build stage.'
+
+        - task: Bash@3
+          displayName: 'DEBUG: Verify Downloaded Artifact'
+          inputs:
+            targetType: 'inline'
+            script: |
+              echo "##[command]Verifying contents of download directory: $(Pipeline.Workspace)/proxy_bundle"
+              ls -la $(Pipeline.Workspace)/proxy_bundle
+              echo "INFO: Expected artifact name: ${{ parameters.artifactName }}"
+          continueOnError: true # Don't fail if listing fails, main check is in deploy script
+
+        # --- Authenticate to GCP using Workload Identity Federation & Impersonation ---
+        - task: Bash@3
+          displayName: 'Authenticate to GCP & Impersonate Target SA'
+          inputs:
+            targetType: 'inline'
+            script: |
+              set -e # Exit immediately if a command exits with a non-zero status.
+              echo "INFO: Starting GCP authentication process..."
+              echo "INFO: Target GCP Project: ${{ parameters.gcpProject }}"
+              echo "INFO: Target Apigee Environment: ${{ parameters.apigeeEnv }}"
+              echo "INFO: Target GCP Service Account for Impersonation: ${{ parameters.targetGcpServiceAccount }}"
+              echo "INFO: Agent Kubernetes Namespace: ${{ parameters.agentKsaNamespace }}"
+              echo "INFO: Agent Kubernetes Service Account: ${{ parameters.agentKsaName }}"
+
+              echo "##[command]gcloud config set project ${{ parameters.gcpProject }}"
+              gcloud config set project ${{ parameters.gcpProject }}
+              if [ $? -ne 0 ]; then echo "##vso[task.logissue type=error;]ERROR: Failed to set GCP project."; exit 1; fi
+
+              echo "##[command]gcloud config set auth/impersonate_service_account ${{ parameters.targetGcpServiceAccount }}"
+              gcloud config set auth/impersonate_service_account ${{ parameters.targetGcpServiceAccount }}
+              if [ $? -ne 0 ]; then echo "##vso[task.logissue type=error;]ERROR: Failed to configure gcloud for SA impersonation."; exit 1; fi
+
+              echo "INFO: Verifying active gcloud configuration..."
+              echo "##[command]gcloud config list"
+              gcloud config list --format='value(core.project, auth.impersonate_service_account)' # Show relevant config
+
+              echo "INFO: Attempting to get impersonated access token to verify authentication..."
+              echo "##[command]gcloud auth print-access-token (checking impersonation)"
+              # Obtain and immediately discard a token just to verify impersonation works
+              gcloud auth print-access-token --quiet
+              if [ $? -ne 0 ]; then
+                echo "##vso[task.logissue type=error;]ERROR: Failed to obtain access token using impersonated SA (${{ parameters.targetGcpServiceAccount }})."
+                echo "##[error]Check Workload Identity setup: GKE cluster -> WIF Pool -> IAM bindings for KSA (${{ parameters.agentKsaNamespace }}/${{ parameters.agentKsaName }}) allowing impersonation of the target SA."
+                exit 1
+              fi
+              echo "INFO: Successfully obtained token for impersonated SA. Authentication successful."
+
+              echo "INFO: Final active gcloud identity:"
+              echo "##[command]gcloud auth list"
+              gcloud auth list # Should show the impersonated SA as active
+            failOnStderr: true
+
+        # --- Import and Deploy API Proxy to Apigee X ---
+        - task: Bash@3
+          displayName: 'Import & Deploy Apigee Proxy Revision'
+          inputs:
+            targetType: 'inline'
+            script: |
+              set -e # Exit immediately on error
+
+              # --- Define variables for clarity ---
+              PROXY_NAME="${{ parameters.apiProxyName }}"
+              BUNDLE_FILE="$(Pipeline.Workspace)/proxy_bundle/${{ parameters.apiProxyName }}_bundle.zip"
+              APIGEE_ORG="${{ parameters.apigeeOrg }}"
+              APIGEE_ENV="${{ parameters.apigeeEnv }}"
+              APIGEE_API_ENDPOINT="https://apigee.googleapis.com/v1" # Apigee Management API base URL
+
+              echo "INFO: --- Starting Apigee Deployment ---"
+              echo "INFO: Apigee Organization: $APIGEE_ORG"
+              echo "INFO: Apigee Environment: $APIGEE_ENV"
+              echo "INFO: API Proxy Name: $PROXY_NAME"
+              echo "INFO: Bundle File Path: $BUNDLE_FILE"
+
+              echo "DEBUG: Checking if bundle file exists..."
+              if [ ! -f "$BUNDLE_FILE" ]; then
+                echo "##vso[task.logissue type=error;]ERROR: API Proxy bundle file not found at '$BUNDLE_FILE'!"
+                exit 1
+              fi
+              ls -l "$BUNDLE_FILE" # Log file details
+
+              echo "INFO: Obtaining GCP OAuth Token for Apigee API calls (using impersonated SA)..."
+              TOKEN=$(gcloud auth print-access-token)
+              if [ -z "$TOKEN" ]; then
+                echo "##vso[task.logissue type=error;]ERROR: Failed to get GCP auth token for Apigee API calls."
+                exit 1
+              fi
+              echo "INFO: Successfully obtained GCP OAuth Token."
+              # echo "DEBUG: Token (first 10 chars): $(echo $TOKEN | cut -c 1-10)..." # Avoid logging full token
+
+              # --- 1. Import API Proxy (creates a new revision) ---
+              IMPORT_URL="$APIGEE_API_ENDPOINT/organizations/$APIGEE_ORG/apis?name=$PROXY_NAME&action=import"
+              echo "INFO: Importing API Proxy to $APIGEE_ORG as '$PROXY_NAME'..."
+              echo "DEBUG: Import URL: $IMPORT_URL"
+              echo "##[command]curl -X POST '$IMPORT_URL' -H 'Authorization: Bearer ***' -H 'Content-Type: multipart/form-data' -F file=@$BUNDLE_FILE ..."
+
+              # Use --fail: exits non-zero on >=400 HTTP status
+              # Use --show-error: Shows error even with -s
+              # Use --silent (-s): Suppresses progress meter but not errors with --show-error
+              # Capture response for parsing and error reporting
+              IMPORT_RESPONSE=$(curl -X POST "$IMPORT_URL" \
+                -H "Authorization: Bearer $TOKEN" \
+                -H "Content-Type: multipart/form-data" \
+                -F "file=@$BUNDLE_FILE" \
+                --fail --show-error --silent)
+              CURL_EXIT_CODE=$? # Capture exit code immediately
+
+              echo "DEBUG: Import curl exit code: $CURL_EXIT_CODE"
+              echo "DEBUG: Import Response Body: $IMPORT_RESPONSE" # Log the response for debugging
+
+              if [ $CURL_EXIT_CODE -ne 0 ]; then
+                  echo "##vso[task.logissue type=error;]ERROR: Failed to import API proxy bundle (curl exit code: $CURL_EXIT_CODE)."
+                  # Response might already be printed by curl --show-error, but log it again explicitly if needed
+                  # echo "##[error]Import Response: $IMPORT_RESPONSE"
+                  exit 1
+              fi
+              echo "INFO: API Proxy import request successful."
+
+              # --- Extract the new revision number ---
+              echo "INFO: Extracting revision number from import response..."
+              # Use jq to parse JSON response; check if .revision exists and is not null
+              REVISION=$(echo "$IMPORT_RESPONSE" | jq -r 'if .revision then .revision else empty end')
+
+              if [ -z "$REVISION" ]; then
+                echo "##vso[task.logissue type=warning;]WARNING: Could not automatically extract revision number from import response."
+                echo "DEBUG: Import Response was: $IMPORT_RESPONSE"
+                # Fallback: Try listing revisions and getting the latest one
+                LIST_REVISIONS_URL="$APIGEE_API_ENDPOINT/organizations/$APIGEE_ORG/apis/$PROXY_NAME/revisions"
+                echo "INFO: Attempting fallback: Listing revisions from $LIST_REVISIONS_URL..."
+                REVISIONS_LIST=$(curl -s -f -X GET "$LIST_REVISIONS_URL" -H "Authorization: Bearer $TOKEN")
+                LIST_EXIT_CODE=$?
+                echo "DEBUG: List Revisions Response: $REVISIONS_LIST"
+                if [ $LIST_EXIT_CODE -eq 0 ]; then
+                   # Get the last revision number in the returned array safely
+                   LATEST_REV=$(echo "$REVISIONS_LIST" | jq -r 'try .[-1] // empty')
+                   if [[ "$LATEST_REV" =~ ^[0-9]+$ ]]; then
+                      echo "INFO: Fallback successful. Using latest known revision: $LATEST_REV"
+                      REVISION=$LATEST_REV
+                   else
+                      echo "##vso[task.logissue type=error;]ERROR: Fallback failed. Could not determine latest revision number from list: $REVISIONS_LIST"
+                      exit 1
+                   fi
+                else
+                   echo "##vso[task.logissue type=error;]ERROR: Fallback failed. Could not list revisions (curl exit code: $LIST_EXIT_CODE)."
+                   exit 1
+                fi
+              fi
+              echo "INFO: Identified Apigee Proxy Revision: $REVISION"
+              echo "##vso[task.setvariable variable=apigeeRevision;isOutput=true]$REVISION" # Make revision available as output variable
+
+              # --- 2. Deploy the new revision ---
+              # Note: Deployment is asynchronous. This command only triggers it.
+              # Add ?override=true to automatically undeploy any existing revision in the environment.
+              DEPLOY_URL="$APIGEE_API_ENDPOINT/organizations/$APIGEE_ORG/environments/$APIGEE_ENV/apis/$PROXY_NAME/revisions/$REVISION/deployments?override=true"
+              echo "INFO: Triggering deployment of Revision $REVISION to environment $APIGEE_ENV..."
+              echo "DEBUG: Deploy URL: $DEPLOY_URL"
+              echo "##[command]curl -X POST '$DEPLOY_URL' -H 'Authorization: Bearer ***' -H 'Content-Type: application/json' ..."
+
+              DEPLOY_RESPONSE=$(curl -X POST "$DEPLOY_URL" \
+                -H "Authorization: Bearer $TOKEN" \
+                -H "Content-Type: application/json" \
+                --fail --show-error --silent)
+              CURL_EXIT_CODE=$?
+
+              echo "DEBUG: Deploy curl exit code: $CURL_EXIT_CODE"
+              echo "DEBUG: Deploy Response Body: $DEPLOY_RESPONSE" # Log the response for debugging
+
+              if [ $CURL_EXIT_CODE -ne 0 ]; then
+                  echo "##vso[task.logissue type=error;]ERROR: Failed to trigger deployment for revision $REVISION (curl exit code: $CURL_EXIT_CODE)."
+                  # echo "##[error]Deploy Response: $DEPLOY_RESPONSE"
+                  exit 1
+              fi
+
+              echo "INFO: Deployment trigger successful for Revision $REVISION to $APIGEE_ENV."
+              echo "INFO: Deployment happens asynchronously in Apigee. Monitor status via Apigee UI or API polling (polling not implemented in this script)."
+              echo "INFO: --- Apigee Deployment Finished ---"
+            failOnStderr: true # Fail task if script writes to stderr or exits non-zero
+
+        # --- Optional: Post-Deployment Steps ---
+        # Add steps here for:
+        # - Smoke tests against the deployed proxy URL
+        # - Integration tests
+        # - Notifying teams
+        # Example:
+        # - task: Bash@3
+        #   displayName: 'Run Smoke Test'
+        #   inputs:
+        #     targetType: 'inline'
+        #     script: |
+        #       echo "INFO: Running smoke test..."
+        #       # curl -I https://your-apigee-proxy-endpoint/...
+        #       echo "WARNING: Actual smoke test skipped."

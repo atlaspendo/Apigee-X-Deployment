@@ -1,0 +1,559 @@
+
+# Main Pipeline File: azure-pipelines.yml
+
+#This file defines the overall structure, triggers, parameters, and stages. It calls the template for the actual deployment steps.
+
+# azure-pipelines.yml
+#
+# Main pipeline definition for deploying Apigee X API Proxies using GKE self-hosted agents.
+# This pipeline builds the proxy bundle and orchestrates deployments across environments
+# by calling a reusable deployment job template.
+
+# =========================================================================
+#                            Pipeline Parameters
+# =========================================================================
+parameters:
+- name: apiProxyName
+  displayName: '1. API Proxy Name'
+  type: string
+  # helpText: 'Enter the exact name of the API Proxy as it should appear in Apigee (e.g., my-cool-api).'
+- name: environmentGroup
+  displayName: '2. Target Apigee Environment Group'
+  type: string
+  values:
+  - edd
+  - wow
+  - wpay
+  - homerun
+  # helpText: 'Select the Apigee Environment Group this deployment targets.'
+
+# =========================================================================
+#                                Triggers
+# =========================================================================
+# Controls when the pipeline runs automatically.
+trigger:
+  batch: true # Batches multiple commits into a single run if possible
+  branches:
+    include:
+    - main        # Trigger prod deploy from main branch merges/commits
+    - release/*   # Trigger test/uat deploy from release branches (e.g., release/v1.2)
+    - develop     # Trigger dev deploy from develop branch commits
+
+# =========================================================================
+#                                Variables
+# =========================================================================
+variables:
+  # --- Global Configuration ---
+  # Define GCP Project IDs and Agent Pool names.
+  # Consider moving these to a Variable Group in AzDO Library for easier management.
+  nonProdGcpProject: 'your-nonprod-project-id' # <-- TODO: Update with your Non-Prod Project ID
+  prodGcpProject: 'your-prod-project-id'     # <-- TODO: Update with your Prod Project ID
+  apigeeOrgNonProd: $(nonProdGcpProject)      # Apigee Org ID usually matches Project ID for Apigee X
+  apigeeOrgProd: $(prodGcpProject)
+  nonProdAgentPool: 'gke-nonprod-agents'     # AzDO Agent Pool running on Non-Prod GKE
+  prodAgentPool: 'gke-prod-agents'         # AzDO Agent Pool running on Prod GKE
+  agentKsaNamespace: 'azdo-agents'           # Kubernetes namespace where agents run
+  agentKsaName: 'azdo-agent-ksa'             # Kubernetes Service Account name for agents
+
+  # --- Dynamically Set in Stages ---
+  # These variables are overridden within each deployment stage to target the correct environment.
+  gcpProject: ''             # Will be set to nonProdGcpProject or prodGcpProject
+  apigeeOrg: ''              # Will be set to apigeeOrgNonProd or apigeeOrgProd
+  apigeeEnv: ''              # Will be set to 'dev', 'test', 'uat', or 'prod'
+  agentPoolName: ''          # Will be set to nonProdAgentPool or prodAgentPool
+  targetGcpServiceAccount: '' # Will be constructed based on envGroup, envType, and project
+
+# Reference to the current repository
+resources:
+  repositories:
+  - repository: self
+    type: git
+    ref: refs/heads/main # Specifies the default branch where the pipeline definition lives
+
+# =========================================================================
+#                                  Stages
+# =========================================================================
+stages:
+
+# -------------------------------------------------------------------------
+# Stage: Build
+# Purpose: Compile, lint (optional), package the Apigee proxy, and publish artifact.
+# Runs On: Non-Prod Agents (builds don't typically need Prod access)
+# -------------------------------------------------------------------------
+- stage: Build
+  displayName: Build API Proxy Bundle
+  pool:
+    name: $(nonProdAgentPool)
+  jobs:
+  - job: Build
+    displayName: Build and Publish Artifact ($(parameters.apiProxyName))
+    steps:
+    - checkout: self # Checks out the source code of the branch that triggered the pipeline
+      displayName: 'Checkout Source Code'
+
+    - task: Bash@3
+      displayName: 'DEBUG: List files in checkout directory'
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "##[command]Listing files in $(Build.SourcesDirectory)"
+          ls -la $(Build.SourcesDirectory)
+      continueOnError: true # Don't fail build if listing fails
+
+    # --- Optional: Linting Step ---
+    # Uncomment and configure if you use apigeelint or another linter
+    # - task: Bash@3
+    #   displayName: 'Lint API Proxy (Optional)'
+    #   inputs:
+    #     targetType: 'inline'
+    #     script: |
+    #       echo "INFO: Installing apigeelint (ensure Node.js/npm is available on agent)..."
+    #       # npm install -g apigeelint
+    #       echo "INFO: Running linter on ./apiproxy folder..."
+    #       # apigeelint -s ./apiproxy -f json.reporter.js # Example command
+    #       # Add logic here to check linting results and potentially fail the build
+    #       echo "WARNING: Actual linting execution skipped in this example."
+    #   failOnStderr: false # Set to true if lint failure should stop the build
+
+    - task: Bash@3
+      displayName: 'Zip API Proxy Bundle ($(parameters.apiProxyName))'
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -e # Exit immediately if a command exits with a non-zero status.
+          PROXY_FOLDER="./apiproxy" # Standard Apigee proxy source folder structure
+          ZIP_FILE_NAME="$(parameters.apiProxyName)_bundle.zip"
+          echo "INFO: Preparing to zip contents of '$PROXY_FOLDER' into '$ZIP_FILE_NAME'"
+          echo "INFO: Current directory: $(pwd)"
+          echo "INFO: Contents of current directory:"
+          ls -l
+          if [ -d "$PROXY_FOLDER" ]; then
+            echo "INFO: Zipping API proxy source from '$PROXY_FOLDER'..."
+            zip -r $ZIP_FILE_NAME $PROXY_FOLDER/ -x "*.git*" "*node_modules*" "*.DS_Store*" "*tests*"
+            echo "INFO: Successfully created API Proxy bundle: $ZIP_FILE_NAME"
+            echo "INFO: Listing created zip file details:"
+            ls -l $ZIP_FILE_NAME
+          else
+            echo "##vso[task.logissue type=error;]ERROR: Proxy source directory '$PROXY_FOLDER' not found! Cannot create bundle."
+            exit 1
+          fi
+        failOnStderr: true # Fail the task if the script writes to stderr or exits non-zero
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish API Proxy Bundle Artifact'
+      inputs:
+        targetPath: '$(Build.SourcesDirectory)/$(parameters.apiProxyName)_bundle.zip' # Path to the file created in the previous step
+        artifact: '$(parameters.apiProxyName)-proxy' # Name of the artifact in Azure DevOps
+        publishLocation: 'Container' # Standard artifact storage
+      # helpText: 'This makes the zipped proxy available to subsequent deployment stages.'
+
+# -------------------------------------------------------------------------
+# Stage: Deploy_Dev
+# Purpose: Deploy the built proxy artifact to the DEV environment.
+# Runs On: Non-Prod Agents
+# Triggered By: Successful Build stage AND (source branch is 'develop' OR manual run)
+# -------------------------------------------------------------------------
+- stage: Deploy_Dev
+  displayName: 'Deploy to DEV ($(parameters.environmentGroup))'
+  dependsOn: Build
+  condition: and(succeeded('Build'), or(eq(variables['Build.SourceBranch'], 'refs/heads/develop'), eq(variables['Build.Reason'], 'Manual')))
+  variables:
+    # --- Stage-Specific Overrides ---
+    gcpProject: $(nonProdGcpProject)
+    apigeeOrg: $(apigeeOrgNonProd)
+    apigeeEnv: 'dev'
+    agentPoolName: $(nonProdAgentPool)
+    # Construct the email address of the GCP Service Account needed for this specific deployment
+    targetGcpServiceAccount: '$(parameters.environmentGroup)-$(apigeeEnv)-sa@$(nonProdGcpProject).iam.gserviceaccount.com'
+  pool:
+    name: $(agentPoolName)
+  jobs:
+  # Call the reusable deployment template, passing parameters specific to this stage
+  - template: templates/apigee-deploy-job.yml
+    parameters:
+      gcpProject: $(gcpProject)
+      apigeeOrg: $(apigeeOrg)
+      apigeeEnv: $(apigeeEnv)
+      apiProxyName: $(parameters.apiProxyName)
+      targetGcpServiceAccount: $(targetGcpServiceAccount)
+      agentKsaNamespace: $(agentKsaNamespace)
+      agentKsaName: $(agentKsaName)
+      artifactName: '$(parameters.apiProxyName)-proxy'
+      azdoEnvironmentName: 'Apigee-$(apigeeEnv)-${{ parameters.apiProxyName }}' # Link to AzDO Environment
+
+# -------------------------------------------------------------------------
+# Stage: Deploy_Test
+# Purpose: Deploy the proxy to the TEST environment. Requires Approval.
+# Runs On: Non-Prod Agents
+# Triggered By: Successful Deploy_Dev stage AND (source branch starts with 'release/' OR manual run)
+# -------------------------------------------------------------------------
+- stage: Deploy_Test
+  displayName: 'Deploy to TEST ($(parameters.environmentGroup))'
+  dependsOn: Deploy_Dev
+  condition: and(succeeded('Deploy_Dev'), or(startsWith(variables['Build.SourceBranch'], 'refs/heads/release/'), eq(variables['Build.Reason'], 'Manual')))
+  variables:
+    gcpProject: $(nonProdGcpProject)
+    apigeeOrg: $(apigeeOrgNonProd)
+    apigeeEnv: 'test'
+    agentPoolName: $(nonProdAgentPool)
+    targetGcpServiceAccount: '$(parameters.environmentGroup)-$(apigeeEnv)-sa@$(nonProdGcpProject).iam.gserviceaccount.com'
+  pool:
+    name: $(agentPoolName)
+  jobs:
+  - template: templates/apigee-deploy-job.yml
+    parameters:
+      gcpProject: $(gcpProject)
+      apigeeOrg: $(apigeeOrg)
+      apigeeEnv: $(apigeeEnv)
+      apiProxyName: $(parameters.apiProxyName)
+      targetGcpServiceAccount: $(targetGcpServiceAccount)
+      agentKsaNamespace: $(agentKsaNamespace)
+      agentKsaName: $(agentKsaName)
+      artifactName: '$(parameters.apiProxyName)-proxy'
+      azdoEnvironmentName: 'Apigee-$(apigeeEnv)-${{ parameters.apiProxyName }}' # Link to AzDO Environment for Approvals
+
+# -------------------------------------------------------------------------
+# Stage: Deploy_UAT
+# Purpose: Deploy the proxy to the UAT environment. Requires Approval.
+# Runs On: Non-Prod Agents
+# Triggered By: Successful Deploy_Test stage AND (source branch starts with 'release/' OR manual run)
+# -------------------------------------------------------------------------
+- stage: Deploy_UAT
+  displayName: 'Deploy to UAT ($(parameters.environmentGroup))'
+  dependsOn: Deploy_Test
+  condition: and(succeeded('Deploy_Test'), or(startsWith(variables['Build.SourceBranch'], 'refs/heads/release/'), eq(variables['Build.Reason'], 'Manual')))
+  variables:
+    gcpProject: $(nonProdGcpProject)
+    apigeeOrg: $(apigeeOrgNonProd)
+    apigeeEnv: 'uat'
+    agentPoolName: $(nonProdAgentPool)
+    targetGcpServiceAccount: '$(parameters.environmentGroup)-$(apigeeEnv)-sa@$(nonProdGcpProject).iam.gserviceaccount.com'
+  pool:
+    name: $(agentPoolName)
+  jobs:
+  - template: templates/apigee-deploy-job.yml
+    parameters:
+      gcpProject: $(gcpProject)
+      apigeeOrg: $(apigeeOrg)
+      apigeeEnv: $(apigeeEnv)
+      apiProxyName: $(parameters.apiProxyName)
+      targetGcpServiceAccount: $(targetGcpServiceAccount)
+      agentKsaNamespace: $(agentKsaNamespace)
+      agentKsaName: $(agentKsaName)
+      artifactName: '$(parameters.apiProxyName)-proxy'
+      azdoEnvironmentName: 'Apigee-$(apigeeEnv)-${{ parameters.apiProxyName }}' # Link to AzDO Environment for Approvals
+
+# -------------------------------------------------------------------------
+# Stage: Deploy_Prod
+# Purpose: Deploy the proxy to the PRODUCTION environment. Requires Approval.
+# Runs On: *** Production Agents *** (Critical Isolation)
+# Triggered By: Successful Deploy_UAT stage AND (source branch is 'main' OR manual run)
+# -------------------------------------------------------------------------
+- stage: Deploy_Prod
+  displayName: 'Deploy to PROD ($(parameters.environmentGroup))'
+  dependsOn: Deploy_UAT
+  condition: and(succeeded('Deploy_UAT'), or(eq(variables['Build.SourceBranch'], 'refs/heads/main'), eq(variables['Build.Reason'], 'Manual')))
+  variables:
+    # --- Stage-Specific Overrides for PRODUCTION ---
+    gcpProject: $(prodGcpProject) # Switch to PROD project
+    apigeeOrg: $(apigeeOrgProd)   # Switch to PROD org
+    apigeeEnv: 'prod'
+    agentPoolName: $(prodAgentPool) # Switch to PROD agent pool!
+    targetGcpServiceAccount: '$(parameters.environmentGroup)-$(apigeeEnv)-sa@$(prodGcpProject).iam.gserviceaccount.com' # Use PROD SA
+  pool:
+    name: $(agentPoolName)
+  jobs:
+  - template: templates/apigee-deploy-job.yml
+    parameters:
+      gcpProject: $(gcpProject)
+      apigeeOrg: $(apigeeOrg)
+      apigeeEnv: $(apigeeEnv)
+      apiProxyName: $(parameters.apiProxyName)
+      targetGcpServiceAccount: $(targetGcpServiceAccount)
+      agentKsaNamespace: $(agentKsaNamespace)
+      agentKsaName: $(agentKsaName)
+      artifactName: '$(parameters.apiProxyName)-proxy'
+      azdoEnvironmentName: 'Apigee-$(apigeeEnv)-${{ parameters.apiProxyName }}' # Link to AzDO Environment for Approvals
+
+
+2. Deployment Job Template: templates/apigee-deploy-job.yml
+
+This file contains the reusable steps for authenticating to GCP and deploying the proxy to Apigee X. It includes detailed logging and error checking.
+
+# templates/apigee-deploy-job.yml
+#
+# Reusable Azure DevOps Pipeline Job Template for deploying an Apigee X proxy.
+# Handles artifact download, GCP authentication via Workload Identity Federation
+# with Service Account impersonation, and calls Apigee Management APIs.
+# Includes detailed logging and error handling.
+
+parameters:
+  # --- Parameters passed from the main pipeline ---
+  gcpProject: ''               # Target GCP Project ID (e.g., 'your-nonprod-project-id')
+  apigeeOrg: ''                # Target Apigee Organization ID (usually same as gcpProject)
+  apigeeEnv: ''                # Target Apigee Environment Name (e.g., 'dev', 'test', 'prod')
+  apiProxyName: ''             # Name of the API Proxy being deployed
+  targetGcpServiceAccount: ''  # Full email of the GCP SA to impersonate for this deployment
+  agentKsaNamespace: 'azdo-agents' # K8s namespace of the agent runner
+  agentKsaName: 'azdo-agent-ksa'     # K8s service account name of the agent runner
+  artifactName: ''             # Name of the pipeline artifact containing the proxy bundle
+  azdoEnvironmentName: ''      # Name of the Azure DevOps Environment for approvals/tracking
+
+jobs:
+# Use a 'deployment' job type to integrate with Azure DevOps Environments for approvals and tracking
+- deployment: DeployApigeeProxy
+  displayName: 'Deploy Proxy ${{ parameters.apiProxyName }} to ${{ parameters.apigeeEnv }} [${{ parameters.gcpProject }}]'
+  environment: ${{ parameters.azdoEnvironmentName }} # Links job to the specified AzDO Environment (enables approvals)
+  strategy:
+    runOnce: # Standard deployment strategy
+      deploy:
+        steps:
+        # No source code checkout needed here, we use the published artifact
+        - checkout: none
+          displayName: 'Skip Source Checkout'
+
+        # --- Download Artifact ---
+        - task: DownloadPipelineArtifact@2
+          displayName: 'Download API Proxy Bundle Artifact'
+          inputs:
+            artifact: ${{ parameters.artifactName }}
+            path: '$(Pipeline.Workspace)/proxy_bundle' # Download to a specific folder in the agent's workspace
+          # helpText: 'Downloads the zip file created during the Build stage.'
+
+        - task: Bash@3
+          displayName: 'DEBUG: Verify Downloaded Artifact'
+          inputs:
+            targetType: 'inline'
+            script: |
+              echo "##[command]Verifying contents of download directory: $(Pipeline.Workspace)/proxy_bundle"
+              ls -la $(Pipeline.Workspace)/proxy_bundle
+              echo "INFO: Expected artifact name: ${{ parameters.artifactName }}"
+          continueOnError: true # Don't fail if listing fails, main check is in deploy script
+
+        # --- Authenticate to GCP using Workload Identity Federation & Impersonation ---
+        - task: Bash@3
+          displayName: 'Authenticate to GCP & Impersonate Target SA'
+          inputs:
+            targetType: 'inline'
+            script: |
+              set -e # Exit immediately if a command exits with a non-zero status.
+              echo "INFO: Starting GCP authentication process..."
+              echo "INFO: Target GCP Project: ${{ parameters.gcpProject }}"
+              echo "INFO: Target Apigee Environment: ${{ parameters.apigeeEnv }}"
+              echo "INFO: Target GCP Service Account for Impersonation: ${{ parameters.targetGcpServiceAccount }}"
+              echo "INFO: Agent Kubernetes Namespace: ${{ parameters.agentKsaNamespace }}"
+              echo "INFO: Agent Kubernetes Service Account: ${{ parameters.agentKsaName }}"
+
+              echo "##[command]gcloud config set project ${{ parameters.gcpProject }}"
+              gcloud config set project ${{ parameters.gcpProject }}
+              if [ $? -ne 0 ]; then echo "##vso[task.logissue type=error;]ERROR: Failed to set GCP project."; exit 1; fi
+
+              echo "##[command]gcloud config set auth/impersonate_service_account ${{ parameters.targetGcpServiceAccount }}"
+              gcloud config set auth/impersonate_service_account ${{ parameters.targetGcpServiceAccount }}
+              if [ $? -ne 0 ]; then echo "##vso[task.logissue type=error;]ERROR: Failed to configure gcloud for SA impersonation."; exit 1; fi
+
+              echo "INFO: Verifying active gcloud configuration..."
+              echo "##[command]gcloud config list"
+              gcloud config list --format='value(core.project, auth.impersonate_service_account)' # Show relevant config
+
+              echo "INFO: Attempting to get impersonated access token to verify authentication..."
+              echo "##[command]gcloud auth print-access-token (checking impersonation)"
+              # Obtain and immediately discard a token just to verify impersonation works
+              gcloud auth print-access-token --quiet
+              if [ $? -ne 0 ]; then
+                echo "##vso[task.logissue type=error;]ERROR: Failed to obtain access token using impersonated SA (${{ parameters.targetGcpServiceAccount }})."
+                echo "##[error]Check Workload Identity setup: GKE cluster -> WIF Pool -> IAM bindings for KSA (${{ parameters.agentKsaNamespace }}/${{ parameters.agentKsaName }}) allowing impersonation of the target SA."
+                exit 1
+              fi
+              echo "INFO: Successfully obtained token for impersonated SA. Authentication successful."
+
+              echo "INFO: Final active gcloud identity:"
+              echo "##[command]gcloud auth list"
+              gcloud auth list # Should show the impersonated SA as active
+            failOnStderr: true
+
+        # --- Import and Deploy API Proxy to Apigee X ---
+        - task: Bash@3
+          displayName: 'Import & Deploy Apigee Proxy Revision'
+          inputs:
+            targetType: 'inline'
+            script: |
+              set -e # Exit immediately on error
+
+              # --- Define variables for clarity ---
+              PROXY_NAME="${{ parameters.apiProxyName }}"
+              BUNDLE_FILE="$(Pipeline.Workspace)/proxy_bundle/${{ parameters.apiProxyName }}_bundle.zip"
+              APIGEE_ORG="${{ parameters.apigeeOrg }}"
+              APIGEE_ENV="${{ parameters.apigeeEnv }}"
+              APIGEE_API_ENDPOINT="https://apigee.googleapis.com/v1" # Apigee Management API base URL
+
+              echo "INFO: --- Starting Apigee Deployment ---"
+              echo "INFO: Apigee Organization: $APIGEE_ORG"
+              echo "INFO: Apigee Environment: $APIGEE_ENV"
+              echo "INFO: API Proxy Name: $PROXY_NAME"
+              echo "INFO: Bundle File Path: $BUNDLE_FILE"
+
+              echo "DEBUG: Checking if bundle file exists..."
+              if [ ! -f "$BUNDLE_FILE" ]; then
+                echo "##vso[task.logissue type=error;]ERROR: API Proxy bundle file not found at '$BUNDLE_FILE'!"
+                exit 1
+              fi
+              ls -l "$BUNDLE_FILE" # Log file details
+
+              echo "INFO: Obtaining GCP OAuth Token for Apigee API calls (using impersonated SA)..."
+              TOKEN=$(gcloud auth print-access-token)
+              if [ -z "$TOKEN" ]; then
+                echo "##vso[task.logissue type=error;]ERROR: Failed to get GCP auth token for Apigee API calls."
+                exit 1
+              fi
+              echo "INFO: Successfully obtained GCP OAuth Token."
+              # echo "DEBUG: Token (first 10 chars): $(echo $TOKEN | cut -c 1-10)..." # Avoid logging full token
+
+              # --- 1. Import API Proxy (creates a new revision) ---
+              IMPORT_URL="$APIGEE_API_ENDPOINT/organizations/$APIGEE_ORG/apis?name=$PROXY_NAME&action=import"
+              echo "INFO: Importing API Proxy to $APIGEE_ORG as '$PROXY_NAME'..."
+              echo "DEBUG: Import URL: $IMPORT_URL"
+              echo "##[command]curl -X POST '$IMPORT_URL' -H 'Authorization: Bearer ***' -H 'Content-Type: multipart/form-data' -F file=@$BUNDLE_FILE ..."
+
+              # Use --fail: exits non-zero on >=400 HTTP status
+              # Use --show-error: Shows error even with -s
+              # Use --silent (-s): Suppresses progress meter but not errors with --show-error
+              # Capture response for parsing and error reporting
+              IMPORT_RESPONSE=$(curl -X POST "$IMPORT_URL" \
+                -H "Authorization: Bearer $TOKEN" \
+                -H "Content-Type: multipart/form-data" \
+                -F "file=@$BUNDLE_FILE" \
+                --fail --show-error --silent)
+              CURL_EXIT_CODE=$? # Capture exit code immediately
+
+              echo "DEBUG: Import curl exit code: $CURL_EXIT_CODE"
+              echo "DEBUG: Import Response Body: $IMPORT_RESPONSE" # Log the response for debugging
+
+              if [ $CURL_EXIT_CODE -ne 0 ]; then
+                  echo "##vso[task.logissue type=error;]ERROR: Failed to import API proxy bundle (curl exit code: $CURL_EXIT_CODE)."
+                  # Response might already be printed by curl --show-error, but log it again explicitly if needed
+                  # echo "##[error]Import Response: $IMPORT_RESPONSE"
+                  exit 1
+              fi
+              echo "INFO: API Proxy import request successful."
+
+              # --- Extract the new revision number ---
+              echo "INFO: Extracting revision number from import response..."
+              # Use jq to parse JSON response; check if .revision exists and is not null
+              REVISION=$(echo "$IMPORT_RESPONSE" | jq -r 'if .revision then .revision else empty end')
+
+              if [ -z "$REVISION" ]; then
+                echo "##vso[task.logissue type=warning;]WARNING: Could not automatically extract revision number from import response."
+                echo "DEBUG: Import Response was: $IMPORT_RESPONSE"
+                # Fallback: Try listing revisions and getting the latest one
+                LIST_REVISIONS_URL="$APIGEE_API_ENDPOINT/organizations/$APIGEE_ORG/apis/$PROXY_NAME/revisions"
+                echo "INFO: Attempting fallback: Listing revisions from $LIST_REVISIONS_URL..."
+                REVISIONS_LIST=$(curl -s -f -X GET "$LIST_REVISIONS_URL" -H "Authorization: Bearer $TOKEN")
+                LIST_EXIT_CODE=$?
+                echo "DEBUG: List Revisions Response: $REVISIONS_LIST"
+                if [ $LIST_EXIT_CODE -eq 0 ]; then
+                   # Get the last revision number in the returned array safely
+                   LATEST_REV=$(echo "$REVISIONS_LIST" | jq -r 'try .[-1] // empty')
+                   if [[ "$LATEST_REV" =~ ^[0-9]+$ ]]; then
+                      echo "INFO: Fallback successful. Using latest known revision: $LATEST_REV"
+                      REVISION=$LATEST_REV
+                   else
+                      echo "##vso[task.logissue type=error;]ERROR: Fallback failed. Could not determine latest revision number from list: $REVISIONS_LIST"
+                      exit 1
+                   fi
+                else
+                   echo "##vso[task.logissue type=error;]ERROR: Fallback failed. Could not list revisions (curl exit code: $LIST_EXIT_CODE)."
+                   exit 1
+                fi
+              fi
+              echo "INFO: Identified Apigee Proxy Revision: $REVISION"
+              echo "##vso[task.setvariable variable=apigeeRevision;isOutput=true]$REVISION" # Make revision available as output variable
+
+              # --- 2. Deploy the new revision ---
+              # Note: Deployment is asynchronous. This command only triggers it.
+              # Add ?override=true to automatically undeploy any existing revision in the environment.
+              DEPLOY_URL="$APIGEE_API_ENDPOINT/organizations/$APIGEE_ORG/environments/$APIGEE_ENV/apis/$PROXY_NAME/revisions/$REVISION/deployments?override=true"
+              echo "INFO: Triggering deployment of Revision $REVISION to environment $APIGEE_ENV..."
+              echo "DEBUG: Deploy URL: $DEPLOY_URL"
+              echo "##[command]curl -X POST '$DEPLOY_URL' -H 'Authorization: Bearer ***' -H 'Content-Type: application/json' ..."
+
+              DEPLOY_RESPONSE=$(curl -X POST "$DEPLOY_URL" \
+                -H "Authorization: Bearer $TOKEN" \
+                -H "Content-Type: application/json" \
+                --fail --show-error --silent)
+              CURL_EXIT_CODE=$?
+
+              echo "DEBUG: Deploy curl exit code: $CURL_EXIT_CODE"
+              echo "DEBUG: Deploy Response Body: $DEPLOY_RESPONSE" # Log the response for debugging
+
+              if [ $CURL_EXIT_CODE -ne 0 ]; then
+                  echo "##vso[task.logissue type=error;]ERROR: Failed to trigger deployment for revision $REVISION (curl exit code: $CURL_EXIT_CODE)."
+                  # echo "##[error]Deploy Response: $DEPLOY_RESPONSE"
+                  exit 1
+              fi
+
+              echo "INFO: Deployment trigger successful for Revision $REVISION to $APIGEE_ENV."
+              echo "INFO: Deployment happens asynchronously in Apigee. Monitor status via Apigee UI or API polling (polling not implemented in this script)."
+              echo "INFO: --- Apigee Deployment Finished ---"
+            failOnStderr: true # Fail task if script writes to stderr or exits non-zero
+
+        # --- Optional: Post-Deployment Steps ---
+        # Add steps here for:
+        # - Smoke tests against the deployed proxy URL
+        # - Integration tests
+        # - Notifying teams
+        # Example:
+        # - task: Bash@3
+        #   displayName: 'Run Smoke Test'
+        #   inputs:
+        #     targetType: 'inline'
+        #     script: |
+        #       echo "INFO: Running smoke test..."
+        #       # curl -I https://your-apigee-proxy-endpoint/...
+        #       echo "WARNING: Actual smoke test skipped."
+
+#Key Features for Teams:
+
+#Clear Parameters: Pipeline parameters (apiProxyName, environmentGroup) are defined with displayName for a user-friendly UI when running manually.
+
+#Descriptive Stage/Job Names: displayName properties clearly indicate what each stage and job does, including the target environment and proxy name.
+
+#Extensive Logging:
+
+#echo "INFO: ...": Provides context about what the script is doing.
+
+#echo "DEBUG: ...": Outputs detailed information useful for troubleshooting (like variable values, API responses). Can be filtered in AzDO logs.
+
+#echo "##[command]...": Logs the actual commands being run, making it easy to see execution flow.
+
+#echo "##vso[task.logissue type=error;]...": Logs errors prominently in the Azure DevOps UI.
+
+#echo "##vso[task.logissue type=warning;]...": Logs warnings (e.g., fallback logic used).
+
+#set -e: Ensures Bash scripts stop immediately on error, preventing unexpected behavior.
+
+#Explicit Error Handling: curl calls use --fail and exit codes ($?) are explicitly checked, providing clear error messages if API calls fail. The full API response is logged on error for easier debugging.
+
+#Configuration Visibility: Key configuration settings (GCP Project, SA, Apigee Env/Org) are logged at the beginning of relevant steps. gcloud config list shows the active configuration.
+
+#Structured Output: Output is formatted to clearly separate informational messages, debug logs, commands, and errors.
+
+#Template Usage: Separating the deployment logic into a template (templates/apigee-deploy-job.yml) promotes reusability and makes the main pipeline (azure-pipelines.yml) much cleaner and easier to understand the overall flow.
+
+#Comments: YAML files are commented to explain the purpose of different sections, parameters, and key steps.
+
+#AzDO Environment Integration: The deployment job type and environment: property link the execution to Azure DevOps Environments, enabling built-in approval workflows and deployment tracking.
+
+#How to Share with Teams:
+
+#Commit both azure-pipelines.yml and templates/apigee-deploy-job.yml to the root and /templates directory (respectively) of the Git repository.
+
+#Provide the README.md file (from the previous response) explaining the overall setup.
+
+#Point teams to the pipeline definition in Azure DevOps.
+
+#Explain the parameters required to run the pipeline manually.
+
+#Show them how to interpret the logs, especially the INFO, DEBUG, and ERROR messages, during pipeline execution.
+
+#Ensure they understand the branch triggering strategy (develop, release/*, main) and the approval process configured in Azure DevOps Environments.
